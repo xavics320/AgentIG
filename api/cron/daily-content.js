@@ -1,6 +1,8 @@
 import { supabase } from '../../lib/supabase.js';
 import { generatePostContent } from '../../lib/claude.js';
-import { sendMessage } from '../../lib/telegram.js';
+import { generateImage } from '../../lib/imagegen.js';
+import { uploadImage } from '../../lib/storage.js';
+import { sendPhoto } from '../../lib/telegram.js';
 
 export default async function handler(req, res) {
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -26,12 +28,19 @@ export default async function handler(req, res) {
       brand,
     });
 
+    // Genera l'immagine con OpenAI a partire dal prompt scritto da Claude,
+    // poi la carica su Supabase Storage per ottenere un URL pubblico
+    const imageBase64 = await generateImage(content.image_prompt);
+    const filename = `post-${entry.id}-${Date.now()}.png`;
+    const imageUrl = await uploadImage(imageBase64, filename);
+
     const { data: post } = await supabase
       .from('posts')
       .insert({
         calendar_id: entry.id,
         caption: content.caption,
         image_prompt: content.image_prompt,
+        image_url: imageUrl,
         status: 'pending',
       })
       .select()
@@ -42,17 +51,22 @@ export default async function handler(req, res) {
       .update({ status: 'content_generated' })
       .eq('id', entry.id);
 
-    // NOTA: qui manca la generazione/scelta immagine effettiva.
-    // Opzioni: generarla con un modello immagini e caricarla su storage pubblico (es. Vercel Blob, Supabase Storage),
-    // oppure mandarti solo il prompt e caricare tu manualmente il file prima di approvare.
-    await sendMessage(
+    // Manda l'immagine vera (non solo testo) cosi' puoi valutarla prima di approvare.
+    // Controlliamo result.ok perche' Telegram puo' rispondere con status 200
+    // anche in caso di errore logico (es. URL immagine non raggiungibile)
+    const telegramResult = await sendPhoto(
       process.env.TELEGRAM_CHAT_ID,
-      `✍️ *Contenuto pronto per il ${entry.post_date}*\n\n*Caption:*\n${content.caption}\n\n*Immagine suggerita:*\n${content.image_prompt}`,
+      imageUrl,
+      `✍️ *Contenuto pronto per il ${entry.post_date}*\n\n${content.caption}`,
       [
         { text: '✅ Approva', callback_data: `approve_post:${post.id}` },
         { text: '❌ Rigenera', callback_data: `reject_post:${post.id}` },
       ]
     );
+
+    if (!telegramResult.ok) {
+      console.error('Invio Telegram fallito:', telegramResult);
+    }
   }
 
   return res.status(200).json({ ok: true, processed: dueEntries.length });
