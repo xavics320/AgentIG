@@ -35,6 +35,7 @@ per contenuti Instagram, con approvazione via Telegram.
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 ANTHROPIC_API_KEY=
+OPENAI_API_KEY=   # usata per generare l'immagine (DALL-E 3)
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 IG_USER_ID=
@@ -50,18 +51,9 @@ vercel deploy --prod
 
 ## Nota sulle immagini
 
-Il flusso attuale genera *caption + prompt immagine*, ma non l'immagine stessa.
-Instagram richiede un URL pubblico per l'immagine (non un upload diretto).
-Due strade:
-
-1. **Manuale (più semplice per iniziare):** generi/scegli tu l'immagine e la carichi
-   su Supabase Storage o Vercel Blob, poi aggiorni manualmente `posts.image_url`
-   prima di premere "Approva" su Telegram.
-2. **Automatica:** integri un modello di generazione immagini (es. tramite API)
-   nello step `daily-content.js`, caricando il risultato su storage pubblico
-   e salvando l'URL automaticamente.
-
-Ti consiglio di partire con l'opzione 1 per validare il flusso, poi automatizzare.
+Il flusso genera *caption + prompt immagine* con Claude, poi l'immagine vera e propria
+con OpenAI (DALL-E 3, richiede `OPENAI_API_KEY`) e la carica sul bucket pubblico
+`post-images` di Supabase Storage, salvando l'URL in `posts.image_url` automaticamente.
 
 ## Flusso completo
 
