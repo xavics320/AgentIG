@@ -1,6 +1,6 @@
 import { supabase } from '../../lib/supabase.js';
 import { generatePostContent } from '../../lib/claude.js';
-import { generateImage } from '../../lib/imagegen.js';
+import { generateImage } from '../../lib/imageGen.js';
 import { applyLogo } from '../../lib/branding.js';
 import { uploadImage } from '../../lib/storage.js';
 import { sendPhoto } from '../../lib/telegram.js';
@@ -11,11 +11,13 @@ export default async function handler(req, res) {
   }
 
   const today = new Date().toISOString().split('T')[0];
-  const brand = 'Xavi - sviluppatore front-end freelance, React/JS, clienti PMI e artigiani italiani';
 
+  // La select con "clients(*)" e' un JOIN: Supabase recupera in un colpo solo
+  // sia la riga di content_calendar sia i dati del cliente collegato (tramite
+  // la foreign key client_id), evitando una query separata per ogni entry.
   const { data: dueEntries, error } = await supabase
     .from('content_calendar')
-    .select('*')
+    .select('*, clients(*)')
     .eq('post_date', today)
     .eq('status', 'calendar_approved');
 
@@ -23,31 +25,35 @@ export default async function handler(req, res) {
   if (!dueEntries.length) return res.status(200).json({ ok: true, message: 'Nessun post previsto oggi' });
 
   for (const entry of dueEntries) {
+    const client = entry.clients; // dati del cliente, gia' inclusi grazie al join
     try {
-      console.log(`[${entry.id}] Inizio generazione contenuto testuale...`);
+      console.log(`[${entry.id}] Cliente: ${client.name}. Inizio generazione contenuto...`);
       const content = await generatePostContent({
         contentType: entry.content_type,
         topicSummary: entry.topic_summary,
-        brand,
+        brand: client.brand_description,
+        style: {
+          bgColor: client.style_bg_color,
+          textColor: client.style_text_color,
+          accentColor: client.style_accent_color,
+        },
       });
-      console.log(`[${entry.id}] Contenuto testuale generato. Caption length: ${content.caption?.length}, image_prompt: ${content.image_prompt?.slice(0, 60)}...`);
+      console.log(`[${entry.id}] Contenuto testuale generato.`);
 
-      console.log(`[${entry.id}] Chiamata a OpenAI per generare l'immagine...`);
       const imageBase64 = await generateImage(content.image_prompt);
-      console.log(`[${entry.id}] Immagine ricevuta da OpenAI. Lunghezza base64: ${imageBase64?.length}`);
+      console.log(`[${entry.id}] Immagine ricevuta da OpenAI.`);
 
-      console.log(`[${entry.id}] Applico il logo sopra l'immagine generata...`);
-      const finalImageBuffer = await applyLogo(imageBase64);
-      console.log(`[${entry.id}] Logo applicato. Dimensione buffer finale: ${finalImageBuffer.length} byte`);
+      const finalImageBuffer = await applyLogo(imageBase64, client.logo_url);
+      console.log(`[${entry.id}] Logo applicato.`);
 
       const filename = `post-${entry.id}-${Date.now()}.png`;
-      console.log(`[${entry.id}] Upload su Supabase Storage con nome file: ${filename}`);
       const imageUrl = await uploadImage(finalImageBuffer, filename);
-      console.log(`[${entry.id}] Upload completato. URL pubblico: ${imageUrl}`);
+      console.log(`[${entry.id}] Upload completato. URL: ${imageUrl}`);
 
       const { data: post, error: insertError } = await supabase
         .from('posts')
         .insert({
+          client_id: client.id,
           calendar_id: entry.id,
           caption: content.caption,
           image_prompt: content.image_prompt,
@@ -59,7 +65,7 @@ export default async function handler(req, res) {
 
       if (insertError || !post) {
         console.error(`[${entry.id}] Errore inserimento riga posts:`, insertError);
-        continue; // passa alla prossima entry invece di interrompere tutto
+        continue;
       }
       console.log(`[${entry.id}] Riga posts creata con id: ${post.id}`);
 
@@ -68,10 +74,8 @@ export default async function handler(req, res) {
         .update({ status: 'content_generated' })
         .eq('id', entry.id);
 
-      // Controlliamo result.ok perche' Telegram puo' rispondere con status 200
-      // anche in caso di errore logico (es. URL immagine non raggiungibile)
       const telegramResult = await sendPhoto(
-        process.env.TELEGRAM_CHAT_ID,
+        client.telegram_chat_id,
         imageUrl,
         `✍️ *Contenuto pronto per il ${entry.post_date}*\n\n${content.caption}`,
         [
@@ -86,8 +90,6 @@ export default async function handler(req, res) {
         console.log(`[${entry.id}] Foto inviata su Telegram con successo.`);
       }
     } catch (err) {
-      // Cattura QUALSIASI errore imprevisto in questa singola entry,
-      // lo stampa per intero nei log, e permette al ciclo di continuare
       console.error(`[${entry.id}] Errore imprevisto:`, err.message, err.stack);
     }
   }
