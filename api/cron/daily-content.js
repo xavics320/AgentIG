@@ -4,13 +4,14 @@ import { generateImage } from '../../lib/imageGen.js';
 import { applyLogo } from '../../lib/branding.js';
 import { uploadImage } from '../../lib/storage.js';
 import { sendPhoto } from '../../lib/telegram.js';
+import { getTodayInTimezone } from '../../lib/dateUtils.js';
 
 export default async function handler(req, res) {
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).end();
   }
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = getTodayInTimezone();
 
   // La select con "clients(*)" e' un JOIN: Supabase recupera in un colpo solo
   // sia la riga di content_calendar sia i dati del cliente collegato (tramite

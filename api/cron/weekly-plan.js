@@ -1,13 +1,14 @@
 import { supabase } from '../../lib/supabase.js';
 import { generateWeeklyPlan } from '../../lib/claude.js';
 import { sendMessage } from '../../lib/telegram.js';
+import { getTodayInTimezone } from '../../lib/dateUtils.js';
 
 export default async function handler(req, res) {
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).end();
   }
 
-  const weekStart = new Date().toISOString().split('T')[0];
+  const weekStart = getTodayInTimezone();
 
   // Legge tutti i clienti attivi: ognuno riceve la propria proposta
   // di calendario, generata con il proprio brand e la propria frequenza
