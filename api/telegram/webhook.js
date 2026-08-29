@@ -1,12 +1,24 @@
 import { supabase } from '../../lib/supabase.js';
-import { answerCallbackQuery, sendMessage } from '../../lib/telegram.js';
+import { answerCallbackQuery, sendMessage, sendPhoto } from '../../lib/telegram.js';
 import { publishToInstagram } from '../../lib/instagram.js';
+import { generatePostAssets } from '../../lib/postGenerator.js';
 
 export default async function handler(req, res) {
   const update = req.body;
-  const callback = update.callback_query;
-  if (!callback) return res.status(200).end();
 
+  // Telegram manda tipi diversi di update nello stesso webhook:
+  // "callback_query" per i click sui bottoni, "message" per il testo libero.
+  // Le gestiamo in due rami separati.
+  if (update.callback_query) {
+    await handleCallbackQuery(update.callback_query);
+  } else if (update.message?.text) {
+    await handleTextMessage(update.message);
+  }
+
+  return res.status(200).end();
+}
+
+async function handleCallbackQuery(callback) {
   const [action, ...params] = callback.data.split(':');
   const chatId = callback.message.chat.id;
 
@@ -51,8 +63,6 @@ export default async function handler(req, res) {
           break;
         }
 
-        // Recupera le credenziali Instagram DEL CLIENTE SPECIFICO di questo post,
-        // non piu' variabili globali: ogni cliente pubblica sul proprio account
         const { data: client, error: clientError } = await supabase
           .from('clients')
           .select('ig_user_id, ig_access_token')
@@ -90,9 +100,19 @@ export default async function handler(req, res) {
 
       case 'reject_post': {
         const [postId] = params;
-        await supabase.from('posts').update({ status: 'rejected' }).eq('id', postId);
-        await answerCallbackQuery(callback.id, 'Scartato, verrà rigenerato');
-        await sendMessage(chatId, `Contenuto scartato. Rilancia la generazione quando vuoi.`);
+
+        // Invece di scartare subito, apriamo una "sessione" che aspetta
+        // il prossimo messaggio di testo con il feedback dell'utente.
+        await supabase.from('posts').update({ status: 'needs_feedback' }).eq('id', postId);
+
+        await supabase.from('telegram_sessions').insert({
+          chat_id: String(chatId),
+          pending_action: 'regenerate_post',
+          reference_id: postId,
+        });
+
+        await answerCallbackQuery(callback.id, 'Ok, dimmi cosa cambiare');
+        await sendMessage(chatId, `✏️ Cosa vuoi cambiare in questo post? Scrivimi in un messaggio libero (es. "rendi la caption più breve" o "usa un tono più informale").`);
         break;
       }
 
@@ -103,6 +123,72 @@ export default async function handler(req, res) {
     await answerCallbackQuery(callback.id, 'Errore ⚠️');
     await sendMessage(chatId, `Errore durante l'operazione: ${err.message}`);
   }
+}
 
-  return res.status(200).end();
+async function handleTextMessage(message) {
+  const chatId = message.chat.id;
+  const text = message.text;
+
+  // Cerca una sessione in sospeso per questa chat: se non c'e', il messaggio
+  // e' solo una chiacchiera libera e lo ignoriamo (nessuna sessione attiva
+  // a cui collegarlo).
+  const { data: session } = await supabase
+    .from('telegram_sessions')
+    .select('*')
+    .eq('chat_id', String(chatId))
+    .eq('pending_action', 'regenerate_post')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!session) return;
+
+  const postId = session.reference_id;
+
+  try {
+    const { data: post } = await supabase
+      .from('posts')
+      .select('*, calendar_id')
+      .eq('id', postId)
+      .single();
+
+    const { data: calendarEntry } = await supabase
+      .from('content_calendar')
+      .select('*, clients(*)')
+      .eq('id', post.calendar_id)
+      .single();
+
+    const client = calendarEntry.clients;
+
+    await sendMessage(chatId, `🔄 Rigenero il post con le tue indicazioni, un momento...`);
+
+    const { caption, imagePrompt, imageUrl } = await generatePostAssets({
+      client,
+      contentType: calendarEntry.content_type,
+      topicSummary: calendarEntry.topic_summary,
+      extraInstructions: text, // il feedback dell'utente
+    });
+
+    await supabase
+      .from('posts')
+      .update({ caption, image_prompt: imagePrompt, image_url: imageUrl, status: 'pending' })
+      .eq('id', postId);
+
+    // La sessione e' "consumata": la cancelliamo cosi' un messaggio
+    // successivo non viene interpretato come feedback per questo stesso post
+    await supabase.from('telegram_sessions').delete().eq('id', session.id);
+
+    await sendPhoto(
+      chatId,
+      imageUrl,
+      `✍️ *Nuova versione*\n\n${caption}`,
+      [
+        { text: '✅ Approva', callback_data: `approve_post:${postId}` },
+        { text: '❌ Rigenera', callback_data: `reject_post:${postId}` },
+      ]
+    );
+  } catch (err) {
+    console.error('Errore durante la rigenerazione:', err.message);
+    await sendMessage(chatId, `Errore durante la rigenerazione: ${err.message}`);
+  }
 }
