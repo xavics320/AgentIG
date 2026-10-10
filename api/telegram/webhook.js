@@ -2,6 +2,7 @@ import { supabase } from '../../lib/supabase.js';
 import { answerCallbackQuery, sendMessage, sendPhoto } from '../../lib/telegram.js';
 import { publishToInstagram } from '../../lib/instagram.js';
 import { generatePostAssets } from '../../lib/postGenerator.js';
+import {createWeeklyPlan} from '../../lib/weeklyPlanner.js';
 
 export default async function handler(req, res) {
   const update = req.body;
@@ -30,24 +31,38 @@ async function handleCallbackQuery(callback) {
           .from('content_calendar')
           .update({ status: 'calendar_approved' })
           .eq('week_start', weekStart)
-          .eq('client_id', clientId);
+          .eq('client_id', clientId)
+          .eq('status', 'proposed');
+
         await answerCallbackQuery(callback.id, 'Calendario approvato ✅');
         await sendMessage(chatId, `Calendario della settimana ${weekStart} approvato.`);
         break;
       }
 
       case 'reject_week': {
-        const [weekStart, clientId] = params;
-        await supabase
-          .from('content_calendar')
-          .delete()
-          .eq('week_start', weekStart)
-          .eq('client_id', clientId);
-        await answerCallbackQuery(callback.id, 'Calendario scartato');
-        await sendMessage(chatId, `Ok, calendario scartato.`);
-        break;
-      }
+  const [weekStart, clientId] = params;
 
+  // Se premi "Rigenera" due volte, non devono restare due sessioni in competizione
+  await supabase
+    .from('telegram_sessions')
+    .delete()
+    .eq('chat_id', String(chatId))
+    .eq('pending_action', 'regenerate_week');
+
+  await supabase.from('telegram_sessions').insert({
+    chat_id: String(chatId),
+    pending_action: 'regenerate_week',
+    reference_id: clientId, // uuid del cliente
+    payload: weekStart,     // la data va nella nuova colonna di testo
+  });
+
+  await answerCallbackQuery(callback.id, 'Ok, dimmi cosa cambiare');
+  await sendMessage(
+    chatId,
+    `✏️ Cosa vuoi cambiare nel calendario? Scrivimi in un messaggio libero (es. "voglio un post sui prezzi e uno su una recensione di un cliente").`
+  );
+  break;
+}
       case 'approve_post': {
         const [postId] = params;
 
@@ -136,13 +151,23 @@ async function handleTextMessage(message) {
     .from('telegram_sessions')
     .select('*')
     .eq('chat_id', String(chatId))
-    .eq('pending_action', 'regenerate_post')
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
 
   if (!session) return;
 
+   switch (session.pending_action) {
+    case 'regenerate_post':
+      await regeneratePost(session, chatId, text);
+      break;
+    case 'regenerate_week':
+      await regenerateWeek(session, chatId, text);
+      break;
+  }
+}
+
+async function regeneratePost(session, chatId, text) {
   const postId = session.reference_id;
 
   try {
@@ -189,6 +214,43 @@ async function handleTextMessage(message) {
     );
   } catch (err) {
     console.error('Errore durante la rigenerazione:', err.message);
+    await sendMessage(chatId, `Errore durante la rigenerazione: ${err.message}`);
+  }
+}
+
+async function regenerateWeek(session, chatId, feedback) {
+  const clientId = session.reference_id;
+  const weekStart = session.payload;
+
+  try {
+    const { data: client } = await supabase
+      .from('clients')
+      .select('*')
+      .eq('id', clientId)
+      .single();
+
+    // Solo le proposte ancora in attesa: eventuali righe già approvate non si toccano
+    const { data: oldRows } = await supabase
+      .from('content_calendar')
+      .select('id')
+      .eq('client_id', clientId)
+      .eq('week_start', weekStart)
+      .eq('status', 'proposed');
+
+    await sendMessage(chatId, '🔄 Rigenero il calendario con le tue indicazioni, un momento...');
+
+    await createWeeklyPlan({
+      client,
+      weekStart,
+      extraInstructions: feedback,
+      replaceIds: (oldRows ?? []).map((r) => r.id),
+    });
+
+    // Sessione "consumata" solo a operazione riuscita: se Claude va in errore
+    // puoi semplicemente rimandare il feedback
+    await supabase.from('telegram_sessions').delete().eq('id', session.id);
+  } catch (err) {
+    console.error('Errore rigenerazione calendario:', err.message);
     await sendMessage(chatId, `Errore durante la rigenerazione: ${err.message}`);
   }
 }
